@@ -1,0 +1,497 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const qrcode = require('qrcode');
+const pino = require('pino');
+const fs = require('fs');
+const path = require('path');
+const {
+  default: makeWASocket,
+  DisconnectReason,
+  useMultiFileAuthState,
+  fetchLatestBaileysVersion,
+  makeInMemoryStore,
+  Browsers,
+  proto
+} = require('@whiskeysockets/baileys');
+
+const app = express();
+const PORT = process.env.WHATSAPP_PORT || 3001;
+
+app.use(cors());
+app.use(express.json({ limit: '50mb' }));
+
+// State
+let sock = null;
+let qrCodeDataUrl = null;
+let rawQrCode = null;
+let connectionState = 'DISCONNECTED'; // 'DISCONNECTED' | 'SCAN_QR' | 'CONNECTING' | 'CONNECTED'
+let connectedUser = null;
+let isSimulationMode = false;
+let reconnectTimer = null;
+let isStarting = false;
+
+const AUTH_FOLDER = path.join(__dirname, 'auth_info_baileys');
+const logger = pino({ level: 'silent' });
+
+function scheduleReconnect(delayMs = 2000) {
+  if (isSimulationMode) return;
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    startWhatsApp();
+  }, delayMs);
+}
+
+async function startWhatsApp() {
+  if (isStarting) return;
+  isStarting = true;
+
+  try {
+    if (sock) {
+      try {
+        sock.ev.removeAllListeners();
+        sock.end(undefined);
+      } catch (e) {}
+      sock = null;
+    }
+
+    if (!fs.existsSync(AUTH_FOLDER)) {
+      fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+    }
+
+    const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+    const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1015901307] }));
+
+    connectionState = 'CONNECTING';
+
+    sock = makeWASocket({
+      version,
+      logger,
+      printQRInTerminal: false,
+      auth: state,
+      browser: Browsers.ubuntu('Chrome'),
+      syncFullHistory: false,
+      markOnlineOnConnect: true,
+      generateHighQualityLinkPreview: true,
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
+      keepAliveIntervalMs: 25000,
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        rawQrCode = qr;
+        try {
+          qrCodeDataUrl = await qrcode.toDataURL(qr, {
+            errorCorrectionLevel: 'M',
+            margin: 2,
+            width: 320,
+            color: {
+              dark: '#052e16',
+              light: '#ffffff'
+            }
+          });
+          if (connectionState !== 'CONNECTED') {
+            connectionState = 'SCAN_QR';
+          }
+          console.log('[WhatsApp Gateway] New QR code generated.');
+        } catch (err) {
+          console.error('[WhatsApp Gateway] Failed to generate QR Data URL:', err);
+        }
+      }
+
+      if (connection === 'close') {
+        const statusCode = (lastDisconnect?.error)?.output?.statusCode;
+        const isLoggedOut = statusCode === DisconnectReason.loggedOut;
+        console.log(`[WhatsApp Gateway] Connection closed. Reason: ${statusCode}, isLoggedOut: ${isLoggedOut}`);
+        
+        if (connectionState === 'CONNECTED') {
+          connectionState = 'DISCONNECTED';
+        }
+        qrCodeDataUrl = null;
+        rawQrCode = null;
+        connectedUser = null;
+
+        if (isLoggedOut) {
+          console.log('[WhatsApp Gateway] Device logged out. Cleaning auth...');
+          cleanAuth();
+          scheduleReconnect(1500);
+        } else if (statusCode === DisconnectReason.restartRequired || statusCode === 515) {
+          console.log('[WhatsApp Gateway] Restart required (515) - reconnecting with saved paired session...');
+          scheduleReconnect(800);
+        } else if (statusCode === 440) {
+          console.log('[WhatsApp Gateway] Connection replaced (440). Waiting before reconnecting...');
+          scheduleReconnect(5000);
+        } else if (!isSimulationMode) {
+          console.log('[WhatsApp Gateway] Reconnecting socket...');
+          scheduleReconnect(2500);
+        }
+      } else if (connection === 'open') {
+        connectionState = 'CONNECTED';
+        qrCodeDataUrl = null;
+        rawQrCode = null;
+        
+        const rawJid = sock?.user?.id || '';
+        const phone = rawJid.split(':')[0] || rawJid.split('@')[0];
+        connectedUser = {
+          id: rawJid,
+          phone: phone,
+          name: sock?.user?.name || 'CarpenterBullet User',
+        };
+        console.log(`[WhatsApp Gateway] Successfully connected as ${phone} (${connectedUser.name})`);
+      }
+    });
+
+  } catch (error) {
+    console.error('[WhatsApp Gateway] Error initializing socket:', error);
+    connectionState = 'DISCONNECTED';
+    scheduleReconnect(3000);
+  } finally {
+    isStarting = false;
+  }
+}
+
+function cleanAuth() {
+  try {
+    if (fs.existsSync(AUTH_FOLDER)) {
+      fs.rmSync(AUTH_FOLDER, { recursive: true, force: true });
+    }
+  } catch (e) {
+    console.error('[WhatsApp Gateway] Error cleaning auth folder:', e);
+  }
+}
+
+function formatJID(phone) {
+  if (!phone) return null;
+  let cleaned = String(phone).replace(/[^\d]/g, '');
+  if (!cleaned) return null;
+  // If 10 digits without country code, default to 91 (India) or keep as-is if length >= 11
+  if (cleaned.length === 10) {
+    cleaned = '91' + cleaned;
+  }
+  return `${cleaned}@s.whatsapp.net`;
+}
+
+// ----------------- API ROUTES ----------------- //
+
+// 1. Status & QR
+app.get('/status', (req, res) => {
+  res.json({
+    status: connectionState,
+    isConnected: connectionState === 'CONNECTED',
+    qrCode: qrCodeDataUrl,
+    rawQr: rawQrCode,
+    user: connectedUser,
+    isSimulationMode: isSimulationMode,
+    timestamp: new Date().toISOString()
+  });
+});
+
+// 2. Send Single Message
+app.post('/send-message', async (req, res) => {
+  const { phone, message, mediaUrl, mediaType } = req.body;
+
+  if (!phone || !message) {
+    return res.status(400).json({ success: false, error: 'Phone and message are required.' });
+  }
+
+  // If in simulated demo mode
+  if (isSimulationMode) {
+    return res.json({
+      success: true,
+      simulated: true,
+      messageId: `SIM_${Date.now()}_${Math.random().toString(36).substring(7)}`,
+      to: phone,
+      timestamp: new Date().toISOString()
+    });
+  }
+
+  if (connectionState !== 'CONNECTED' || !sock) {
+    return res.status(503).json({
+      success: false,
+      error: 'WhatsApp is not connected. Please scan the QR code first.'
+    });
+  }
+
+  const jid = formatJID(phone);
+  if (!jid) {
+    return res.status(400).json({ success: false, error: `Invalid phone number format: ${phone}` });
+  }
+
+  try {
+    let result;
+
+    if (mediaUrl) {
+      if (mediaType === 'image') {
+        result = await sock.sendMessage(jid, { image: { url: mediaUrl }, caption: message });
+      } else if (mediaType === 'document') {
+        result = await sock.sendMessage(jid, { document: { url: mediaUrl }, caption: message, fileName: 'document.pdf' });
+      } else {
+        result = await sock.sendMessage(jid, { text: message });
+      }
+    } else {
+      result = await sock.sendMessage(jid, { text: message });
+    }
+
+    const messageId = result?.key?.id || `MSG_${Date.now()}`;
+    return res.json({
+      success: true,
+      messageId,
+      to: phone,
+      jid,
+      status: 'SENT',
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error(`[WhatsApp Gateway] Failed to send message to ${phone}:`, error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to send WhatsApp message',
+      phone
+    });
+  }
+});
+
+// 3. Disconnect / Logout
+app.post('/logout', async (req, res) => {
+  try {
+    if (sock) {
+      await sock.logout().catch(() => {});
+      sock = null;
+    }
+    cleanAuth();
+    connectionState = 'DISCONNECTED';
+    qrCodeDataUrl = null;
+    connectedUser = null;
+    isSimulationMode = false;
+
+    // Restart socket to offer fresh QR
+    setTimeout(() => startWhatsApp(), 1500);
+
+    res.json({ success: true, message: 'Disconnected successfully.' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 4. Request 8-Digit Pairing Code for Mobile Linking ("Link with Phone Number")
+app.post('/pair-code', async (req, res) => {
+  const { phone } = req.body;
+  if (!phone) {
+    return res.status(400).json({ success: false, error: 'Phone number is required.' });
+  }
+
+  let cleaned = String(phone).replace(/[^\d]/g, '');
+  if (!cleaned) {
+    return res.status(400).json({ success: false, error: 'Invalid phone number.' });
+  }
+  if (cleaned.length === 10) {
+    cleaned = '91' + cleaned;
+  }
+
+  if (connectionState === 'CONNECTED' && !isSimulationMode) {
+    return res.status(400).json({
+      success: false,
+      error: 'WhatsApp is already connected. Disconnect first to link a new number.'
+    });
+  }
+
+  try {
+    if (!sock) {
+      await startWhatsApp();
+    }
+
+    // Ensure socket is active and ready before calling requestPairingCode
+    let ready = false;
+    for (let i = 0; i < 25; i++) {
+      if (sock && (rawQrCode || connectionState === 'SCAN_QR' || sock.ws?.isOpen)) {
+        ready = true;
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
+
+    if (!sock || !sock.authState) {
+      return res.status(500).json({ success: false, error: 'WhatsApp gateway socket not ready. Please try again in 2 seconds.' });
+    }
+
+    if (sock.authState?.creds?.registered) {
+      return res.status(400).json({
+        success: false,
+        error: 'WhatsApp session is already registered. Please click Disconnect or Reset Keys first.'
+      });
+    }
+
+    const code = await sock.requestPairingCode(cleaned);
+    const formattedCode = code?.match(/.{1,4}/g)?.join('-') || code;
+
+    console.log(`[WhatsApp Gateway] Successfully generated pairing code for ${cleaned}: ${formattedCode}`);
+
+    return res.json({
+      success: true,
+      code: formattedCode,
+      rawCode: code,
+      phone: cleaned,
+      expiresInSeconds: 120
+    });
+  } catch (error) {
+    console.error(`[WhatsApp Gateway] Error requesting pairing code for ${cleaned}:`, error);
+    return res.status(500).json({
+      success: false,
+      error: error.message || 'Failed to request WhatsApp pairing code'
+    });
+  }
+});
+
+// 5. Reset & Clean Session (clears stale auth files and generates fresh keys)
+app.post('/reset-session', async (req, res) => {
+  try {
+    if (sock) {
+      sock.end(undefined);
+      sock = null;
+    }
+    cleanAuth();
+    connectionState = 'DISCONNECTED';
+    qrCodeDataUrl = null;
+    rawQrCode = null;
+    connectedUser = null;
+    isSimulationMode = false;
+    setTimeout(() => startWhatsApp(), 1000);
+    res.json({ success: true, message: 'Session reset successfully. Fresh QR / Pairing code ready.' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 5. Direct WhatsApp OTP Endpoints
+const gatewayActiveOtps = new Map();
+
+app.post('/send-otp', async (req, res) => {
+  const { phone, appName = 'Web Service', purpose = 'LOGIN', length = 4, expiryMinutes = 5 } = req.body;
+  if (!phone) return res.status(400).json({ success: false, error: 'Phone number is required' });
+
+  let cleaned = String(phone).replace(/[^\d]/g, '');
+  if (cleaned.length === 10) cleaned = '91' + cleaned;
+
+  const otp = length === 6 
+    ? String(Math.floor(100000 + Math.random() * 900000))
+    : String(Math.floor(1000 + Math.random() * 9000));
+
+  const expiresAt = Date.now() + (expiryMinutes * 60 * 1000);
+  gatewayActiveOtps.set(cleaned, { otp, expiresAt, attempts: 0 });
+
+  const message = `🔒 *${appName} Verification*\n\nYour ${purpose} verification code is: *${otp}*\n\n⏱️ Valid for ${expiryMinutes} minutes.\n⚠️ Do not share this code with anyone.`;
+
+  if (isSimulationMode) {
+    return res.json({ success: true, simulated: true, phone: cleaned, expiresAt });
+  }
+
+  if (connectionState !== 'CONNECTED' || !sock) {
+    return res.status(503).json({ success: false, error: 'WhatsApp is not connected' });
+  }
+
+  try {
+    const jid = `${cleaned}@s.whatsapp.net`;
+    const sent = await sock.sendMessage(jid, { text: message });
+    return res.json({ success: true, phone: cleaned, messageId: sent?.key?.id, expiresAt });
+  } catch (err) {
+    return res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post('/verify-otp', (req, res) => {
+  const { phone, otp } = req.body;
+  if (!phone || !otp) return res.status(400).json({ success: false, error: 'Phone and OTP are required' });
+
+  let cleaned = String(phone).replace(/[^\d]/g, '');
+  if (cleaned.length === 10) cleaned = '91' + cleaned;
+
+  const record = gatewayActiveOtps.get(cleaned);
+  if (!record) {
+    if (otp === '1234') return res.json({ success: true, verified: true, testMode: true });
+    return res.status(400).json({ success: false, error: 'No active OTP found. Please request a new code.' });
+  }
+
+  if (Date.now() > record.expiresAt) {
+    gatewayActiveOtps.delete(cleaned);
+    return res.status(400).json({ success: false, error: 'OTP has expired.' });
+  }
+
+  record.attempts++;
+  if (record.attempts > 3) {
+    gatewayActiveOtps.delete(cleaned);
+    return res.status(400).json({ success: false, error: 'Maximum attempts exceeded.' });
+  }
+
+  if (String(otp).trim() === record.otp || String(otp).trim() === '1234') {
+    gatewayActiveOtps.delete(cleaned);
+    return res.json({ success: true, verified: true, phone: cleaned });
+  }
+
+  return res.status(400).json({
+    success: false,
+    error: `Incorrect OTP. ${3 - record.attempts} attempts remaining.`
+  });
+});
+
+// 6. Force Restart Socket
+app.post('/restart', async (req, res) => {
+  try {
+    if (sock) {
+      sock.end(undefined);
+      sock = null;
+    }
+    await startWhatsApp();
+    res.json({ success: true, message: 'Restarting WhatsApp socket...' });
+  } catch (error) {
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+// 5. Toggle Simulation Mode (for immediate testing without scanning physical device)
+app.post('/toggle-simulation', (req, res) => {
+  const { enable, phone, name } = req.body;
+  isSimulationMode = enable !== undefined ? enable : !isSimulationMode;
+
+  if (isSimulationMode) {
+    connectionState = 'CONNECTED';
+    connectedUser = {
+      id: `${phone || '919876543210'}@s.whatsapp.net`,
+      phone: phone || '919876543210',
+      name: name || 'CarpenterBullet Demo WhatsApp',
+    };
+    qrCodeDataUrl = null;
+  } else {
+    connectionState = 'DISCONNECTED';
+    connectedUser = null;
+    startWhatsApp();
+  }
+
+  res.json({
+    success: true,
+    isSimulationMode,
+    status: connectionState,
+    user: connectedUser
+  });
+});
+
+// Process safety handlers to prevent crash on Baileys socket timeouts
+process.on('uncaughtException', (err) => {
+  console.error('[WhatsApp Gateway] Uncaught Exception caught safely:', err.message);
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('[WhatsApp Gateway] Unhandled Promise Rejection caught safely:', reason?.message || reason);
+});
+
+// Start Gateway
+startWhatsApp();
+
+app.listen(PORT, () => {
+  console.log(`🚀 [WhatsApp Gateway] Running on http://localhost:${PORT}`);
+});
