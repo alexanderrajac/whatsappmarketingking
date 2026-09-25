@@ -1,12 +1,18 @@
 FROM node:20-bookworm-slim
 
-# Install Python 3, pip, and Nginx
+# Install Python 3, venv, pip, Nginx, and curl (Debian Bookworm)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
+    python3-venv \
     nginx \
     curl \
     && rm -rf /var/lib/apt/lists/*
+
+# Setup persistent Python virtual environment
+ENV VIRTUAL_ENV=/opt/venv
+RUN python3 -m venv $VIRTUAL_ENV
+ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
 WORKDIR /app
 
@@ -18,7 +24,8 @@ RUN cd frontend && npm run build
 
 # 2. Setup Backend
 COPY backend/requirements.txt ./backend/
-RUN pip3 install --no-cache-dir -r ./backend/requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r ./backend/requirements.txt
 COPY backend/ ./backend/
 
 # 3. Setup WhatsApp Service
